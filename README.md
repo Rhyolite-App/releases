@@ -62,8 +62,20 @@ Rhyolite includes a local [Model Context Protocol (MCP)](https://modelcontextpro
 # Connect Claude Code over stdio (macOS)
 claude mcp add rhyolite -- /Applications/Rhyolite.app/Contents/MacOS/Rhyolite --mcp-stdio --vault ~/Notes
 
-# Run headless docs-as-code, broken-link, secret, and property checks in CI
+# Run headless docs-as-code, broken-link, secret, and property checks locally or in CI
 Rhyolite check --vault ./docs --repo . --checks drift,links,secrets,frontmatter --format sarif --output rhyolite.sarif
+```
+
+### GitHub Action (`Rhyolite check`)
+
+Verify docs-as-code anchors, broken wikilinks, accidental secrets, and properties on every pull request:
+
+```yaml
+- uses: Rhyolite-App/releases/actions/check@main
+  with:
+    vault: docs
+    repo: .
+    comment: 'true'
 ```
 
 ---

@@ -1,0 +1,231 @@
+name: Rhyolite check
+description: >-
+  Checks a Rhyolite (Obsidian-compatible) vault in CI: code anchors that drifted or changed since a note was verified, broken
+  links, secrets and malformed properties. Lists the notes a pull request affects (blast radius), writes a job summary, and can
+  comment on the pull request and upload SARIF to code scanning.
+author: Rhyolite
+branding:
+  icon: file-text
+  color: blue
+
+inputs:
+  vault:
+    description: The vault folder, relative to the workspace.
+    required: false
+    default: '.'
+  repo:
+    description: The repository that code anchors are relative to, relative to the workspace.
+    required: false
+    default: '.'
+  checks:
+    description: 'Comma-separated checks to run: drift, links, secrets, frontmatter.'
+    required: false
+    default: 'drift,links,secrets,frontmatter'
+  fail-on:
+    description: 'Fail the step on findings at or above this level: error, warning or none.'
+    required: false
+    default: 'error'
+  version:
+    description: 'Rhyolite release to download, like 0.2.0 or v0.2.0, or latest.'
+    required: false
+    default: 'latest'
+  base:
+    description: >-
+      Git revision to compare with for the blast radius. Default: the pull request's base commit, or the commit before the push.
+      The action fetches it when the checkout is shallow.
+    required: false
+    default: ''
+  review-days:
+    description: Days after which a review is overdue. Default the vault's setting (90).
+    required: false
+    default: ''
+  comment:
+    description: 'true: create or update one pull request comment with drift, broken links and the blast radius (needs pull-requests: write).'
+    required: false
+    default: 'false'
+  sarif:
+    description: 'true: upload the findings to GitHub code scanning (needs security-events: write).'
+    required: false
+    default: 'false'
+  sarif-category:
+    description: Code scanning category for the upload.
+    required: false
+    default: 'rhyolite-check'
+  rhyolite-path:
+    description: Use this Rhyolite executable instead of downloading a release (for example one built from source).
+    required: false
+    default: ''
+  release-repository:
+    description: The GitHub repository whose releases provide the Rhyolite build.
+    required: false
+    default: 'Rhyolite-App/releases'
+  github-token:
+    description: Token for downloading the release, commenting and uploading SARIF.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  exit-code:
+    description: '0: no findings at or above fail-on; 1: findings; 2: usage or environment error.'
+    value: ${{ steps.check.outputs.exit-code }}
+  errors:
+    description: Number of errors found.
+    value: ${{ steps.check.outputs.errors }}
+  warnings:
+    description: Number of warnings found.
+    value: ${{ steps.check.outputs.warnings }}
+  report:
+    description: Path of the JSON report.
+    value: ${{ steps.check.outputs.report }}
+  sarif-file:
+    description: Path of the SARIF report.
+    value: ${{ steps.check.outputs.sarif }}
+  junit-file:
+    description: Path of the JUnit XML report.
+    value: ${{ steps.check.outputs.junit }}
+  summary-file:
+    description: Path of the Markdown summary.
+    value: ${{ steps.check.outputs.summary }}
+
+runs:
+  using: composite
+  steps:
+    - name: Get Rhyolite
+      id: install
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        RHYOLITE_PATH: ${{ inputs.rhyolite-path }}
+        RHYOLITE_VERSION: ${{ inputs.version }}
+        RELEASE_REPOSITORY: ${{ inputs.release-repository }}
+      run: |
+        set -euo pipefail
+        if [ -n "$RHYOLITE_PATH" ]; then
+          bin="$RHYOLITE_PATH"
+          case "$bin" in /*) ;; *) bin="$GITHUB_WORKSPACE/$bin" ;; esac
+        else
+          if [ "$RUNNER_OS" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
+            echo "::error::This action downloads the linux-x64 build of Rhyolite. Run it on ubuntu-latest, or set rhyolite-path."
+            exit 2
+          fi
+          dir="$RUNNER_TEMP/rhyolite-bin"
+          rm -rf "$dir" && mkdir -p "$dir"
+          tag=()
+          if [ "$RHYOLITE_VERSION" != "latest" ]; then tag=("v${RHYOLITE_VERSION#v}"); fi
+          gh release download "${tag[@]}" --repo "$RELEASE_REPOSITORY" --pattern 'Rhyolite-v*-linux-x64.tar.gz' --dir "$dir"
+          tar -xzf "$dir"/Rhyolite-v*-linux-x64.tar.gz -C "$dir" --strip-components=1
+          bin="$dir/Rhyolite"
+          chmod +x "$bin"
+        fi
+        if [ ! -x "$bin" ]; then
+          echo "::error::Rhyolite wasn't found at $bin."
+          exit 2
+        fi
+        echo "bin=$bin" >> "$GITHUB_OUTPUT"
+
+    - name: Find the base commit
+      id: base
+      shell: bash
+      env:
+        INPUT_BASE: ${{ inputs.base }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        REPO_DIR: ${{ inputs.repo }}
+      run: |
+        set -euo pipefail
+        base="$INPUT_BASE"
+        if [ -z "$base" ]; then
+          case "$EVENT_NAME" in
+            pull_request|pull_request_target) base="$PR_BASE_SHA" ;;
+            merge_group) base="$MERGE_GROUP_BASE_SHA" ;;
+            push) if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then base="$PUSH_BEFORE"; fi ;;
+          esac
+        fi
+        if [ -n "$base" ] && ! git -C "$REPO_DIR" cat-file -e "$base^{commit}" 2>/dev/null; then
+          # Shallow checkouts (the actions/checkout default) don't have the base: fetch just that commit.
+          if git -C "$REPO_DIR" fetch --no-tags --quiet --depth=1 origin "$base"; then
+            base="$(git -C "$REPO_DIR" rev-parse FETCH_HEAD)"
+          else
+            echo "::warning::Couldn't fetch $base, so the blast radius is skipped."
+            base=""
+          fi
+        fi
+        echo "base=$base" >> "$GITHUB_OUTPUT"
+
+    - name: Run rhyolite check
+      id: check
+      shell: bash
+      env:
+        RHYOLITE: ${{ steps.install.outputs.bin }}
+        VAULT: ${{ inputs.vault }}
+        REPO_DIR: ${{ inputs.repo }}
+        CHECKS: ${{ inputs.checks }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        BASE: ${{ steps.base.outputs.base }}
+        REVIEW_DAYS: ${{ inputs.review-days }}
+      run: |
+        set -uo pipefail
+        out="$RUNNER_TEMP/rhyolite-check"
+        rm -rf "$out" && mkdir -p "$out"
+        args=(check --vault "$VAULT" --repo "$REPO_DIR" --checks "$CHECKS" --fail-on "$FAIL_ON" --format text
+          --report "json=$out/report.json" --report "markdown=$out/summary.md"
+          --report "sarif=$out/rhyolite.sarif" --report "junit=$out/junit.xml")
+        if [ -n "$BASE" ]; then args+=(--base "$BASE"); fi
+        if [ -n "$REVIEW_DAYS" ]; then args+=(--review-days "$REVIEW_DAYS"); fi
+        "$RHYOLITE" "${args[@]}"
+        code=$?
+        {
+          echo "exit-code=$code"
+          echo "report=$out/report.json"
+          echo "sarif=$out/rhyolite.sarif"
+          echo "junit=$out/junit.xml"
+          echo "summary=$out/summary.md"
+        } >> "$GITHUB_OUTPUT"
+        if [ "$code" -eq 2 ] || [ ! -f "$out/report.json" ]; then
+          echo "::error::rhyolite check couldn't run (exit code $code). The log above says why."
+          exit 2
+        fi
+        if command -v jq >/dev/null; then
+          echo "errors=$(jq '.summary.errors' "$out/report.json")" >> "$GITHUB_OUTPUT"
+          echo "warnings=$(jq '.summary.warnings' "$out/report.json")" >> "$GITHUB_OUTPUT"
+        fi
+        cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Comment on the pull request
+      if: inputs.comment == 'true' && github.event.pull_request
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        SUMMARY: ${{ steps.check.outputs.summary }}
+      run: |
+        set -uo pipefail
+        marker='<!-- rhyolite-check -->'
+        id="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)"
+        if [ -n "$id" ]; then
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F "body=@$SUMMARY" >/dev/null \
+            || echo "::warning::Couldn't update the Rhyolite comment (does the token have pull-requests: write?)."
+        else
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F "body=@$SUMMARY" >/dev/null \
+            || echo "::warning::Couldn't comment on the pull request (does the token have pull-requests: write?)."
+        fi
+
+    - name: Upload SARIF to code scanning
+      if: inputs.sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.check.outputs.sarif }}
+        category: ${{ inputs.sarif-category }}
+        token: ${{ inputs.github-token }}
+
+    - name: Fail on findings
+      if: steps.check.outputs.exit-code == '1'
+      shell: bash
+      env:
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        echo "::error::rhyolite check found problems at or above --fail-on $FAIL_ON. The job summary lists them."
+        exit 1
